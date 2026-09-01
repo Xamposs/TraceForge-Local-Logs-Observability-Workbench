@@ -34,9 +34,7 @@ jobs:
             libegl1 libxkbcommon0 libdbus-1-3 libfontconfig1 \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-sync1 \
-            libxcb-xfixes0 libxcb-xkb1 libxkbcommon-x11-0
-          # Qt xcb platform plugin needs an X server in CI; we use offscreen.
-          sudo apt-get install -y --no-install-recommends xvfb
+            libxcb-xfixes0 libxcb-xkb1 libxkbcommon-x11-0 xvfb || true
 
       - name: Install package + dev extras
         run: |

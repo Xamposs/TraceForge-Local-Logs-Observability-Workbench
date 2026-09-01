@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="TraceForge icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1c1f24"/>
+      <stop offset="1" stop-color="#0e1116"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4a8cff"/>
+      <stop offset="1" stop-color="#7ad3ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="40" fill="url(#bg)"/>
+  <g stroke="url(#stroke)" stroke-width="6" stroke-linecap="round">
+    <line x1="48"  y1="160" x2="48"  y2="190"/>
+    <line x1="80"  y1="120" x2="80"  y2="190"/>
+    <line x1="112" y1="80"  x2="112" y2="190"/>
+    <line x1="144" y1="100" x2="144" y2="190"/>
+    <line x1="176" y1="70"  x2="176" y2="190"/>
+    <line x1="208" y1="130" x2="208" y2="190"/>
+  </g>
+  <line x1="32" y1="200" x2="224" y2="200" stroke="#3a414d" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="176" cy="70"  r="6" fill="#e26161"/>
+  <circle cx="112" cy="80"  r="6" fill="#d8a13a"/>
+  <text x="128" y="240" font-family="Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="22" font-weight="700" letter-spacing="2"
+        fill="#e3e6ea" text-anchor="middle">TF</text>
+</svg>

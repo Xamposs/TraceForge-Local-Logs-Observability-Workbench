@@ -1,0 +1,10 @@
+{"timestamp":"2026-09-01T12:00:00Z","level":"INFO","message":"service started","service":"api","trace_id":"t1","span_id":"s1","request_id":"r1","duration_ms":12.4,"status_code":200}
+{"timestamp":"2026-09-01T12:00:01Z","level":"INFO","message":"GET /api/users -> 200 in 23.1ms","service":"api","trace_id":"t2","span_id":"s2","request_id":"r2","duration_ms":23.1,"status_code":200}
+{"timestamp":"2026-09-01T12:00:02Z","level":"WARN","message":"Slow query detected: took 742ms","service":"database","trace_id":"t3","span_id":"s3","request_id":"r3","duration_ms":742.0}
+{"timestamp":"2026-09-01T12:00:03Z","level":"ERROR","message":"Connection timeout after 5012ms","service":"payments","trace_id":"t4","span_id":"s4","request_id":"r4","duration_ms":5012.0,"status_code":504,"exception_type":"TimeoutError"}
+{"timestamp":"2026-09-01T12:00:04Z","level":"ERROR","message":"Connection timeout after 4928ms","service":"payments","trace_id":"t5","span_id":"s5","request_id":"r5","duration_ms":4928.0,"status_code":504,"exception_type":"TimeoutError"}
+{"timestamp":"2026-09-01T12:00:05Z","level":"INFO","message":"POST /api/payments -> 200 in 88.0ms","service":"api","trace_id":"t6","span_id":"s6","request_id":"r6","duration_ms":88.0,"status_code":200}
+{"timestamp":"2026-09-01T12:00:06Z","level":"WARN","message":"Cache miss for key: user:482","service":"auth","trace_id":"t7","span_id":"s7","request_id":"r7"}
+{"timestamp":"2026-09-01T12:00:07Z","level":"INFO","message":"background job completed in 4.2ms","service":"orders","trace_id":"t8","span_id":"s8","request_id":"r8","duration_ms":4.2}
+{"timestamp":"2026-09-01T12:00:08Z","level":"ERROR","message":"Payment provider circuit breaker tripped","service":"payments","trace_id":"t9","span_id":"s9","request_id":"r9","duration_ms":402.1,"status_code":503,"exception_type":"CircuitOpenError"}
+{"timestamp":"2026-09-01T12:00:09Z","level":"INFO","message":"GET /api/products -> 200 in 12.0ms","service":"api","trace_id":"t10","span_id":"s10","request_id":"r10","duration_ms":12.0,"status_code":200}

@@ -18,22 +18,28 @@ Run with::
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from datetime import UTC, datetime
 
 import pytest
 
+# The stress test is timing-sensitive and exercises DuckDB's
+# thread-safety semantics. On busy CI runners a rare race can
+# surface; the underlying invariants are still exercised by the
+# regular storage tests. Skip on CI but keep the local-run path.
+_CI = bool(os.environ.get("CI"))
+if _CI:
+    pytest.skip(
+        "concurrency stress test is timing-sensitive; skip in CI",
+        allow_module_level=True,
+    )
+
+
 from traceforge.models.events import LogEvent, SourceFingerprint, SourceStats
 from traceforge.models.sources import SourceConfig
 from traceforge.storage import Database, EventRepository
-
-# DuckDB's Python connection is not strictly thread-safe; the
-# ``Database`` lock serializes execute+fetch but rare race conditions
-# have been observed on busy CI runners. Skip the stress test on CI
-# to keep the suite deterministic; the underlying invariants are
-# covered by the storage tests.
-_CI = bool(__import__("os").environ.get("CI"))
 
 
 def _make_event(i: int) -> LogEvent:
@@ -53,7 +59,6 @@ def _make_event(i: int) -> LogEvent:
     )
 
 
-@pytest.mark.skipif(_CI, reason="Timing-sensitive threading test; covered by local runs")
 def test_concurrent_writes_and_reads(tmp_path) -> None:
     db = Database(tmp_path / "t.duckdb")
     repo = EventRepository(db)

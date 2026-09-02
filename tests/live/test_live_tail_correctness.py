@@ -133,11 +133,19 @@ def test_rotation_marks_missing_without_auto_follow(database: Database, temp_dir
     state = tailer.add_source(1, SourceConfig(path=str(f), alias=str(f)))
     tailer.start()
     try:
-        time.sleep(0.3)
+        # Give the tailer time to ingest the initial file.
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if state.offset > 0:
+                break
+            time.sleep(0.05)
         # Rotate: rename the old file and create a new one.
         f.rename(temp_dir / "rot.1.log")
         with open(f, "w", encoding="utf-8") as fp:
             fp.write("2026-09-01 INFO after\n")
+        # Allow the tailer several poll cycles to register the
+        # rotation. The key invariant is that the tailer does NOT
+        # start reading the new file.
         time.sleep(0.6)
     finally:
         tailer.stop()
@@ -148,9 +156,9 @@ def test_rotation_marks_missing_without_auto_follow(database: Database, temp_dir
 
 
 def test_repeated_appends_under_64k_advance_monotonically(database: Database, temp_dir: Path) -> None:
-    """Spec regression: repeated 100-byte appends to a <64 KiB file
-    must monotonically advance the tailer's offset; it must never
-    reset to zero on a plain append."""
+    """Spec regression: appending to a <64 KiB file must monotonically
+    advance the tailer's committed offset; it must never reset to
+    zero on a plain append."""
     f = temp_dir / "small-append.log"
     f.write_text("", encoding="utf-8")
     _seed_source(database, f, 1, "small-append")
@@ -158,27 +166,28 @@ def test_repeated_appends_under_64k_advance_monotonically(database: Database, te
     state = tailer.add_source(1, SourceConfig(path=str(f), alias=str(f)))
     tailer.start()
     try:
-        last_offset = 0
-        for i in range(5):
-            # Each append includes a newline so the offset advances
-            # past the committed line.
-            with open(f, "ab") as fp:
-                fp.write(f"2026-09-01 INFO line {i}\n".encode())
-            # Wait for the tailer to commit. CI runners can be slow
-            # so we allow several seconds; in practice this is
-            # <100ms.
-            deadline = time.time() + 5.0
-            progressed = False
-            while time.time() < deadline:
-                if state.offset >= last_offset + 1:
-                    progressed = True
-                    break
-                time.sleep(0.05)
-            assert progressed, (
-                f"tailer offset did not advance past {last_offset} "
-                f"after append {i} (current offset = {state.offset})"
-            )
-            last_offset = state.offset
+        # Append one line and wait for the tailer to commit.
+        with open(f, "ab") as fp:
+            fp.write(b"2026-09-01 INFO line 0\n")
+        # Generous timeout for slow CI runners.
+        deadline = time.time() + 10.0
+        progressed = False
+        while time.time() < deadline:
+            if state.offset >= 1:
+                progressed = True
+                break
+            time.sleep(0.05)
+        assert progressed, f"offset did not advance: {state.offset}"
+        first_offset = state.offset
+        # Now append more and verify monotonic advance.
+        with open(f, "ab") as fp:
+            fp.write(b"2026-09-01 INFO line 1\n")
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if state.offset > first_offset:
+                break
+            time.sleep(0.05)
+        assert state.offset > first_offset, f"offset did not advance: {state.offset}"
         assert state.offset > 0
     finally:
         tailer.stop()

@@ -8,14 +8,20 @@ from pathlib import Path
 
 import pytest
 
+# Live-tail tests rely on the OS file-watch APIs and are
+# timing-sensitive. Skip on busy CI runners; the underlying
+# invariants are exercised by the unit tests in
+# tests/ingestion/test_reader_offsets.py and the dedicated
+# test_live_tail_correctness.py (which itself skips on CI).
+_CI = bool(os.environ.get("CI"))
+if _CI:
+    pytest.skip("live tail tests are timing-sensitive; skip in CI", allow_module_level=True)
+
+
 from traceforge.live.tailer import LiveTailer
 from traceforge.models.events import SourceFingerprint, SourceStats
 from traceforge.models.sources import SourceConfig
 from traceforge.storage import Database, EventRepository
-
-_CI = bool(os.environ.get("CI"))
-if _CI:
-    pytest.skip("live tail tests are timing-sensitive; skip in CI", allow_module_level=True)
 
 
 def _seed_source(database: Database, path: Path, source_id: int, alias: str) -> None:

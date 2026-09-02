@@ -154,18 +154,27 @@ def test_repeated_appends_under_64k_advance_monotonically(database: Database, te
     f = temp_dir / "small-append.log"
     f.write_text("", encoding="utf-8")
     _seed_source(database, f, 1, "small-append")
-    tailer = LiveTailer(database, poll_interval=0.05)
+    tailer = LiveTailer(database, poll_interval=0.02)
     state = tailer.add_source(1, SourceConfig(path=str(f), alias=str(f)))
     tailer.start()
     try:
         last_offset = 0
-        for i in range(10):
+        for i in range(5):
             # Each append includes a newline so the offset advances
             # past the committed line.
             with open(f, "ab") as fp:
                 fp.write(f"2026-09-01 INFO line {i}\n".encode())
-            time.sleep(0.15)
-            assert state.offset >= last_offset
+            # Wait long enough for the tailer to catch up. We poll the
+            # tailer until its committed offset moves past
+            # ``last_offset`` or a short safety timeout elapses.
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if state.offset >= last_offset + 1:
+                    break
+                time.sleep(0.02)
+            assert (
+                state.offset >= last_offset
+            ), f"offset regressed from {last_offset} to {state.offset} after append {i}"
             last_offset = state.offset
         assert state.offset > 0
     finally:

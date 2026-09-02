@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 
 from traceforge.ingestion.ids import stamp_event_id
 from traceforge.models.events import LogEvent, normalize_severity
-from traceforge.parsers.base import ParsedRecord, Parser, ParserContext
+from traceforge.parsers.base import ParsedRecord, Parser, ParserContext, SourceLine
 
 _TS_KEYS = ("timestamp", "time", "ts", "@timestamp", "datetime", "date", "event_time")
 _LVL_KEYS = ("level", "severity", "log.level", "loglevel", "log_level", "levelname")
@@ -27,13 +27,31 @@ _DUR_KEYS = ("duration_ms", "duration", "latency_ms", "elapsed_ms", "response_ti
 _STATUS_KEYS = ("status_code", "status", "http.status_code", "http_status", "code")
 _EXC_KEYS = ("exception_type", "exception", "error_type", "error.kind")
 
+_KNOWN_TOP_LEVEL = frozenset(
+    _TS_KEYS
+    + _LVL_KEYS
+    + _MSG_KEYS
+    + _SVC_KEYS
+    + _LOGGER_KEYS
+    + _HOST_KEYS
+    + _PROC_KEYS
+    + _THREAD_KEYS
+    + _TRACE_KEYS
+    + _SPAN_KEYS
+    + _PARENT_KEYS
+    + _REQUEST_KEYS
+    + _SESSION_KEYS
+    + _DUR_KEYS
+    + _STATUS_KEYS
+    + _EXC_KEYS
+)
+
 
 def _first(obj: dict, keys: tuple[str, ...]) -> object | None:
     for k in keys:
         v = obj.get(k)
         if v is not None:
             return v
-    # nested with dots
     for k in keys:
         if "." in k:
             cur: object = obj
@@ -51,7 +69,6 @@ def _parse_timestamp(value: object) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        # Heuristic: > 10^12 is millis, > 10^15 is micro, otherwise seconds.
         try:
             v = float(value)
         except (TypeError, ValueError):
@@ -74,11 +91,50 @@ def _parse_timestamp(value: object) -> datetime | None:
     return None
 
 
+def _coerce_str(v: object) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    return str(v)
+
+
+def _coerce_float(v: object) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(v: object) -> int | None:
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _truncate_text(value: object, limit: int = 8000) -> str:
     s = str(value)
     if len(s) <= limit:
         return s
     return s[:limit] + "..."
+
+
+def _truncate_line(text: str, max_line_bytes: int) -> tuple[str, bool]:
+    """Apply the per-line byte cap; return (text, was_truncated)."""
+    if len(text) <= max_line_bytes:
+        return text, False
+    return text[:max_line_bytes] + "...[truncated]", True
 
 
 class JsonLinesParser(Parser):
@@ -102,46 +158,44 @@ class JsonLinesParser(Parser):
 
     def parse(
         self,
-        lines,
+        lines: Iterable[SourceLine],
         context: ParserContext,
     ) -> Iterator[ParsedRecord | None]:
         now = datetime.now(tz=UTC)
-        start = max(1, context.start_line)
-        for line_no, raw in enumerate(lines, start=start):
-            if not raw:
+        for src in lines:
+            text, was_truncated = _truncate_line(src.text, context.max_line_bytes)
+            if not text.strip():
                 continue
-            s = raw.rstrip("\n\r")
-            if not s.strip():
-                continue
+            raw = src.raw_bytes
             try:
-                obj = json.loads(s)
+                obj = json.loads(text)
             except (ValueError, TypeError):
                 yield ParsedRecord(
-                    event=self._unknown(now, context, line_no, s, raw),
+                    event=self._unknown(now, context, src, text, raw, was_truncated),
                     unstructured=True,
                 )
                 continue
             if not isinstance(obj, dict):
                 yield ParsedRecord(
-                    event=self._unknown(now, context, line_no, s, raw),
+                    event=self._unknown(now, context, src, text, raw, was_truncated),
                     unstructured=True,
                 )
                 continue
             ts = _parse_timestamp(_first(obj, _TS_KEYS))
             lvl = normalize_severity(str(_first(obj, _LVL_KEYS) or ""))
             msg_obj = _first(obj, _MSG_KEYS)
-            message = _truncate_text(msg_obj if msg_obj is not None else s)
+            message = _truncate_text(msg_obj if msg_obj is not None else text)
             attrs = {k: v for k, v in obj.items() if k not in _KNOWN_TOP_LEVEL}
             ev = LogEvent(
-                event_id="",  # stamped below
+                event_id="",
                 source=context.source_alias,
                 source_path=context.source_path,
-                line_number=line_no,
+                line_number=src.line_number,
                 timestamp=ts,
                 ingested_at=now,
                 severity=lvl,
                 message=message,
-                raw_text=s,
+                raw_text=text,
                 raw_format="json",
                 service=_coerce_str(_first(obj, _SVC_KEYS)),
                 logger=_coerce_str(_first(obj, _LOGGER_KEYS)),
@@ -158,91 +212,65 @@ class JsonLinesParser(Parser):
                 exception_type=_coerce_str(_first(obj, _EXC_KEYS)),
                 attributes=attrs,
             )
-            stamp_event_id(ev, raw.encode("utf-8", errors="replace"), context.fingerprint_sample)
+            # The pipeline will fill byte_offset/line_number from the
+            # SourceLine, but we already know them here; set them now so
+            # the event is fully self-describing for tests.
+            ev.byte_offset = src.byte_offset
+            ev.line_number = src.line_number
+            stamp_event_id(ev, raw, context.fingerprint_sample)
             yield ParsedRecord(event=ev, unstructured=False)
 
-    def _unknown(self, now, context, line_no, s, raw):
-        # Apply the per-line byte cap from the parser context, preserving a
-        # visible truncation marker.
-        truncated = s.endswith("...[truncated]")
-        if not truncated and len(s) > context.max_line_bytes:
-            s = s[: context.max_line_bytes] + "...[truncated]"
-            truncated = True
-        msg = s[:8000]
-        if truncated and "[truncated]" not in msg:
+    def _unknown(
+        self,
+        now: datetime,
+        context: ParserContext,
+        src: SourceLine,
+        text: str,
+        raw: bytes,
+        was_truncated: bool,
+    ) -> LogEvent:
+        msg = text[:8000]
+        if was_truncated and "[truncated]" not in msg:
             msg = msg.rstrip() + "...[truncated]"
         ev = LogEvent(
             event_id="",
             source=context.source_alias,
             source_path=context.source_path,
-            line_number=line_no,
+            line_number=src.line_number,
             timestamp=None,
             ingested_at=now,
             severity="UNKNOWN",
             message=msg,
-            raw_text=s,
+            raw_text=text,
             raw_format="json",
         )
-        stamp_event_id(ev, raw.encode("utf-8", errors="replace"), context.fingerprint_sample)
+        ev.byte_offset = src.byte_offset
+        ev.line_number = src.line_number
+        stamp_event_id(ev, raw, context.fingerprint_sample)
         return ev
 
-
-def _coerce_str(v) -> str | None:
-    if v is None:
-        return None
-    if isinstance(v, str):
-        return v
-    return str(v)
-
-
-def _coerce_float(v) -> float | None:
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_int(v) -> int | None:
-    if v is None:
-        return None
-    if isinstance(v, int):
-        return v
-    if isinstance(v, float):
-        return int(v)
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
-
-
-_KNOWN_TOP_LEVEL = set(
-    _TS_KEYS
-    + _LVL_KEYS
-    + _MSG_KEYS
-    + _SVC_KEYS
-    + _LOGGER_KEYS
-    + _HOST_KEYS
-    + _PROC_KEYS
-    + _THREAD_KEYS
-    + _TRACE_KEYS
-    + _SPAN_KEYS
-    + _PARENT_KEYS
-    + _REQUEST_KEYS
-    + _SESSION_KEYS
-    + _DUR_KEYS
-    + _STATUS_KEYS
-    + _EXC_KEYS
-)
+    def is_multiline_capable(self) -> bool:
+        return False
 
 
 class JsonArrayParser(Parser):
-    """Parses a single JSON array of objects, e.g. ``[ {...}, {...} ]``."""
+    """Parses a single JSON array of objects, e.g. ``[ {...}, {...} ]``.
+
+    **Memory note.** This parser buffers all source lines internally
+    because the JSON-array format cannot be parsed incrementally without
+    a full streaming-JSON dependency. Sources larger than
+    :data:`MAX_JSON_ARRAY_BYTES` are refused outright (the parser
+    returns no events and records a diagnostic). For very large
+    datasets, convert the array to JSON Lines first.
+
+    Source position: each parsed element is associated with the byte
+    offset of the first ``{`` that introduces it in the source text
+    (best-effort: arrays of large objects may have inaccurate byte
+    positions if the array contains escaped braces inside strings).
+    """
 
     name = "jsonarray"
+    MAX_JSON_ARRAY_BYTES = 64 * 1024 * 1024  # 64 MiB hard cap
 
     def detect(self, sample_lines: list[str]) -> float:
         if not sample_lines:
@@ -258,41 +286,109 @@ class JsonArrayParser(Parser):
             return 0.95
         return 0.0
 
-    def parse(self, lines, context: ParserContext):
-        buf: list[str] = []
-        for raw in lines:
-            buf.append(raw)
-        if not buf:
+    def parse(
+        self,
+        lines: Iterable[SourceLine],
+        context: ParserContext,
+    ) -> Iterator[ParsedRecord | None]:
+        accumulated: list[SourceLine] = list(lines)
+        if not accumulated:
             return
+        total_bytes = sum(len(s.text) + 1 for s in accumulated)
+        if total_bytes > self.MAX_JSON_ARRAY_BYTES:
+            _record_diagnostic(
+                context,
+                f"jsonarray: source {context.source_path!r} is "
+                f"{total_bytes} bytes which exceeds the hard cap of "
+                f"{self.MAX_JSON_ARRAY_BYTES} bytes. Convert to JSONL "
+                f"for large sources.",
+            )
+            return
+        text = "".join(s.text + "\n" for s in accumulated)
         try:
-            obj = json.loads("".join(buf))
+            obj = json.loads(text)
         except (ValueError, TypeError):
+            _record_diagnostic(context, f"jsonarray: invalid JSON in {context.source_path!r}")
             return
         if not isinstance(obj, list):
+            _record_diagnostic(
+                context,
+                f"jsonarray: top-level value is {type(obj).__name__}, not list",
+            )
             return
+        positions = _index_top_level_object_positions(text)
         inner = JsonLinesParser()
-        line_offset = 0
-        for _idx, item in enumerate(obj, start=1):
+        line_offset = context.start_line
+        for idx, item in enumerate(obj):
             if not isinstance(item, dict):
                 continue
             try:
                 serialized = json.dumps(item, ensure_ascii=False)
             except (TypeError, ValueError):
                 continue
-            yield from inner.parse([serialized], _with_line_offset(context, line_offset + 1))
+            byte_off = positions[idx] if idx < len(positions) else 0
+            pseudo = SourceLine(
+                byte_offset=byte_off,
+                line_number=line_offset,
+                text=serialized,
+                raw_bytes=serialized.encode("utf-8"),
+            )
+            yield from inner.parse([pseudo], context)
             line_offset += 1
-        return
 
 
-def _with_line_offset(ctx: ParserContext, offset: int) -> ParserContext:
-    """Return a copy of the context with line numbers offset to maintain
-    monotonicity when serializing JSON array elements as synthetic lines."""
-    return ParserContext(
-        source_path=ctx.source_path,
-        source_alias=ctx.source_alias,
-        fingerprint_sample=ctx.fingerprint_sample,
-        max_line_bytes=ctx.max_line_bytes,
-        custom_regex=ctx.custom_regex,
-        custom_field_map=dict(ctx.custom_field_map) if ctx.custom_field_map else None,
-        start_line=offset,
-    )
+def _record_diagnostic(context: ParserContext, message: str) -> None:
+    """Append a parser diagnostic to ``context`` without mutating its
+    declared fields. The pipeline harvests the accumulated diagnostics
+    on the way out and forwards them to ``IngestionProgress``.
+    """
+    bucket = getattr(context, "_parser_diagnostics", None)
+    if bucket is None:
+        bucket = []
+        # Stash the bucket back on the context as an ad-hoc attribute.
+        # This is a deliberate side-channel: ParserContext is a small
+        # dataclass-like record and we don't want to add a real field
+        # for an internal pipeline hook.
+        try:
+            object.__setattr__(context, "_parser_diagnostics", bucket)
+        except Exception:
+            pass
+    if bucket is not None:
+        bucket.append(message)
+
+
+def _index_top_level_object_positions(text: str) -> list[int]:
+    """Return approximate byte offsets for the start of each top-level
+    object in a JSON array. This is best-effort and not a full parser."""
+    positions: list[int] = []
+    i = 0
+    n = len(text)
+    # skip leading whitespace and the opening '['
+    while i < n and text[i] in " \t\r\n[":
+        i += 1
+    while i < n:
+        if text[i] == "{":
+            positions.append(i)
+            depth = 1
+            i += 1
+            while i < n and depth > 0:
+                c = text[i]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                elif c == '"':
+                    # skip string
+                    i += 1
+                    while i < n and text[i] != '"':
+                        if text[i] == "\\" and i + 1 < n:
+                            i += 2
+                        else:
+                            i += 1
+                i += 1
+            # skip comma/whitespace
+            while i < n and text[i] in " \t\r\n,":
+                i += 1
+        else:
+            i += 1
+    return positions

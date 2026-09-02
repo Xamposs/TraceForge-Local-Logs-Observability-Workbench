@@ -1,7 +1,14 @@
 """Streaming line reader.
 
 We do not load an entire large file into Python memory. The reader returns
-decoded lines one at a time using a fixed-size buffer and the ``io`` module.
+decoded lines one at a time using a fixed-size buffer.
+
+Every yielded ``byte_offset`` is the EXACT absolute byte position of the
+first byte of that logical line in the source file. This is required for
+deterministic event IDs (see :mod:`traceforge.ingestion.ids`) and for
+accurate live-tail offset tracking.
+
+Line numbers are also exact: we count newlines emitted.
 """
 
 from __future__ import annotations
@@ -23,60 +30,65 @@ def iter_lines(
 ) -> Iterator[tuple[int, str, int]]:
     """Yield ``(byte_offset, line_text, line_number)`` for each line in the file.
 
-    Starts reading from ``start_offset`` (0 for full re-ingest). Strips the
-    trailing newline. Lines longer than ``max_line_bytes`` are truncated.
+    ``start_offset`` is the absolute byte position at which to begin reading.
+    The first yielded line has ``line_number=1``; line numbers always count
+    from 1 regardless of ``start_offset`` (line numbers are informational
+    and are NOT used for event identity).
+
+    Lines longer than ``max_line_bytes`` are truncated; the yielded text ends
+    with a literal ``\"...[truncated]\"`` marker.
+
+    CR (``\\r``) is stripped from the end of each line. LF (``\\n``) is the
+    line terminator. The final unterminated line is emitted as-is on EOF.
     """
     p = Path(os.fspath(path))
     if not p.exists():
         return
     line_no = 1
     leftover = b""
-    pos = 0
+    # ``pos`` is the absolute file offset of the first byte of the data we
+    # are about to process in the next iteration (i.e. data[0] sits at
+    # position ``pos`` in the file).
+    pos = max(0, int(start_offset))
     with open(p, "rb") as f:
-        if start_offset:
-            f.seek(start_offset)
-            pos = start_offset
-            line_no = max(1, _approx_line_for_offset(p, start_offset))
+        if pos:
+            f.seek(pos)
         while True:
-            chunk = f.read(buffer_bytes)
+            chunk = f.read(max(1, int(buffer_bytes)))
             if not chunk:
                 if leftover:
                     text = leftover.decode("utf-8", errors="replace")
                     if len(text) > max_line_bytes:
                         text = text[:max_line_bytes] + "...[truncated]"
                     yield pos, text.rstrip("\n\r"), line_no
-                break
+                return
             data = leftover + chunk
+            data_len = len(data)
             start = 0
-            for i, b in enumerate(data):
+            i = 0
+            while i < data_len:
+                b = data[i]
                 if b == 0x0A:  # \n
                     line_bytes = data[start:i]
                     if line_bytes.endswith(b"\r"):
                         line_bytes = line_bytes[:-1]
-                    try:
-                        text = line_bytes.decode("utf-8", errors="replace")
-                    except Exception:  # pragma: no cover - extremely defensive
-                        text = line_bytes.decode("utf-8", errors="replace")
+                    text = line_bytes.decode("utf-8", errors="replace")
                     if len(text) > max_line_bytes:
                         text = text[:max_line_bytes] + "...[truncated]"
+                    # ``pos + start`` is the absolute file offset of the
+                    # first byte of this logical line.
                     yield pos + start, text, line_no
                     line_no += 1
-                    start = i + 1
+                    i += 1
+                    start = i
+                else:
+                    i += 1
+            # Any bytes beyond the last newline are a partial line; they
+            # become the leftover for the next iteration. Their absolute
+            # file offset is ``pos + start``.
             leftover = data[start:]
-            pos += len(chunk) - len(leftover)
+            pos = pos + start
     return
 
 
-def _approx_line_for_offset(p: Path, offset: int) -> int:
-    """Return an approximate starting line number for an offset.
-
-    We do not seek-line-perfect to avoid an extra full read; the inaccuracy
-    is acceptable because line_number is informational, not a primary key.
-    """
-    if offset <= 0:
-        return 1
-    try:
-        # Average log line ~ 200 bytes is a reasonable default.
-        return max(1, offset // 200)
-    except Exception:
-        return 1
+__all__ = ["DEFAULT_BUFFER_BYTES", "MAX_LINE_BYTES", "iter_lines"]

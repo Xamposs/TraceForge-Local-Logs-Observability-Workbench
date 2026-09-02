@@ -1,7 +1,21 @@
-"""Workspace persistence (``.trf`` JSON file)."""
+"""Workspace persistence (``.trf`` JSON file).
+
+A workspace file stores *references* and configuration only. The
+derived database lives under TraceForge's application data directory
+keyed by the workspace's stable ``workspace_id`` (UUID4). Saving the
+``.trf`` to a different location does not move the database.
+
+Format versions:
+* v1 — no ``workspace_id``; database is expected beside the ``.trf``.
+  On load we synthesise a stable id from the file's parent directory
+  so the existing on-disk database remains findable.
+* v2 — adds an explicit ``workspace_id`` field. This is the new
+  default.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import UTC, datetime
@@ -17,6 +31,17 @@ from traceforge.models.workspace import (
     Workspace,
     WorkspaceSettings,
 )
+
+
+def _stable_id_from_path(path: Path) -> str:
+    """Generate a deterministic workspace_id from a v1 file's path.
+
+    v1 workspaces had no id, so we derive one from the absolute
+    file path. The same path always produces the same id, so a
+    re-load of a v1 ``.trf`` keeps pointing at the same database.
+    """
+    h = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"ws-v1-{h}"
 
 
 def new_workspace(name: str) -> Workspace:
@@ -38,6 +63,12 @@ def load_workspace(path: str | os.PathLike[str]) -> Workspace:
     if not p.exists():
         raise FileNotFoundError(p)
     raw = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid workspace file: not a JSON object")
+    # v1 -> v2 migration: synthesize a stable workspace_id.
+    if "workspace_id" not in raw:
+        raw["workspace_id"] = _stable_id_from_path(p)
+        raw["version"] = WORKSPACE_FORMAT_VERSION
     try:
         ws = Workspace.model_validate(raw)
     except ValidationError as e:

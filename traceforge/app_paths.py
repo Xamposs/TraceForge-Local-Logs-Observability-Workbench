@@ -95,15 +95,22 @@ class AppPaths:
             temp_dir=temp_root,
         )
 
-    def new_workspace_dir(self, slug: str | None = None) -> Path:
-        """Create and return a fresh per-workspace directory."""
-        import time
-        import uuid
+    def new_workspace_dir(self, workspace_id: str) -> Path:
+        """Return the canonical directory for a workspace's derived data.
 
-        name = slug or time.strftime("%Y%m%d-%H%M%S")
-        candidate = self.workspaces_dir / f"ws-{name}-{uuid.uuid4().hex[:8]}"
-        candidate.mkdir(parents=True, exist_ok=False)
-        return candidate
+        Layout::
+
+            workspaces_dir/
+                <workspace_id>/
+                    events.duckdb
+                    events.duckdb.wal
+        """
+        p = self.workspaces_dir / workspace_id
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def workspace_db_path(self, workspace_id: str) -> Path:
+        return self.new_workspace_dir(workspace_id) / "events.duckdb"
 
     def new_temp_path(self, prefix: str = "tf-", suffix: str = "") -> Path:
         name = f"{prefix}{os.getpid()}-{uuid_suffix()}{suffix}"

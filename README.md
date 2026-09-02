@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-112%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-206%20passing-brightgreen.svg)](#testing)
 [![Ruff](https://img.shields.io/badge/ruff-clean-brightgreen.svg)](#development)
 
 A 100% local desktop workbench for exploring, querying, correlating, and
@@ -94,8 +94,13 @@ traceforge generate-demo ./demo-logs --events 50000
 ## Features
 
 - **Streaming ingestion** of `.log`, `.txt`, `.jsonl`, `.ndjson`, `.json`,
-  `.csv` files. Files are read with bounded memory; multi-GB files are
-  handled without loading the full content into Python objects.
+  `.csv` files. The reader is genuinely streaming: it uses fixed-size
+  read buffers, never loads an entire file into memory as one string,
+  and yields lines one at a time with exact byte offsets. Multi-GB
+  files are handled without loading the full content into Python
+  objects. Per-line cap is configurable (default 1 MiB). For the
+  JSON-array format, TraceForge buffers up to 64 MiB and refuses
+  larger sources; convert to JSONL for very large datasets.
 - **Auto-detection** of common formats (JSONL, JSON array, CSV, Apache /
   Nginx combined log, generic text). Detection samples the first 64 KB.
 - **Multiline stack-trace folding** with configurable continuation rules.
@@ -105,8 +110,11 @@ traceforge generate-demo ./demo-logs --events 50000
   `>=` / `<` / `<=`, `CONTAINS` / `STARTS_WITH` / `ENDS_WITH`, `IN (...)`,
   and pipeline stages: `sort`, `limit`, `stats count()` / `avg()` / `p95()`
   / `min()` / `max()` / `sum()` with `by`.
-- **Live tail** of files and directories. Detects append, truncation, and
-  replacement. Batches live events for UI responsiveness.
+- **Live tail** of files and directories. Detects append, truncation,
+  and replacement without mis-classifying a small-file append as a
+  replacement. A partial trailing line without a newline is held
+  until the next append completes it. Rotation is detected but not
+  auto-followed. Batches live events for UI responsiveness.
 - **Deterministic rules engine** with five built-in rules (error rate
   spike, new error signature, latency threshold, event burst, missing
   heartbeat). No AI, no LLM. Every alert explains what fired and why.
@@ -207,8 +215,13 @@ tailer.add_source(source_id=1, cfg=SourceConfig(path="/var/log/app.log"))
 tailer.start()
 ```
 
-The tailer detects append / truncation / replacement and uses byte
-offsets so it never re-reads lines it has already processed.
+The tailer detects append / truncation / replacement by comparing
+the file's first sample bytes (prefix-agreement test) and its inode.
+A plain append on a small file is never mis-classified as a
+replacement. File rotation (rename + new file at the same path) is
+detected; TraceForge does not auto-follow the rotated file — operators
+must add it as a new source. A partial trailing line without a
+newline is buffered until a newline completes it.
 
 ---
 
@@ -242,14 +255,17 @@ observed value, and the time window. See [`docs/RULES.md`](docs/RULES.md).
 
 ## Performance
 
-Measured on a Windows 11 dev machine (Python 3.12, DuckDB 1.1, NVMe SSD):
+Measured on a Windows 11 dev machine (Python 3.12, NVMe SSD). The
+bundled demo generator produces a deterministic 5-service
+microservice workload (see `benchmarks/perf_validate.py`).
 
-| Dataset | Ingestion | DB size | Query latency (severity = ERROR) |
+| Dataset | Ingestion | DB size | Query latency (`severity = ERROR`) |
 | --- | --- | --- | --- |
-| 100 000 events (5 services) | ≈ 30 s | ≈ 65 MB | ≈ 100 ms |
-| 1 000 000 events (5 services) | ≈ 5 min | ≈ 600 MB | ≈ 200 ms |
+| 100 000 events (5 services) | ≈ 150 s | ≈ 65 MB | ≈ 130 ms |
+| 1 000 000 events (5 services) | measured once at ≈ 320 s in v0.1 baseline; the v0.1 hardening pass did **not** re-measure end-to-end because the per-file path dominates and the change is in correctness, not throughput. | ≈ 600 MB | ≈ 200 ms |
 
-YMMV by host; the dataset is the bundled demo generator.
+YMMV by host; rerun `python benchmarks/perf_validate.py 100000` to
+confirm.
 
 ---
 
@@ -288,7 +304,7 @@ TraceForge's own application-data directory.
 pytest
 ```
 
-The suite includes 112 tests covering:
+The suite includes 206 tests covering:
 
 - Parser detection and behaviour for every supported format
 - TFQL parser, AST, compiler, executor, **and SQL-injection safety**

@@ -105,7 +105,9 @@ class Parser:
         if self._peek().kind is TKind.PIPE:
             self._advance()
             stage = self._parse_stage()
-            if isinstance(stage, SortStage):
+            if isinstance(stage, list):
+                sort.extend(stage)
+            elif isinstance(stage, SortStage):
                 sort.append(stage)
             elif isinstance(stage, LimitStage):
                 limit = stage.count
@@ -115,7 +117,9 @@ class Parser:
                 raise TFQLSyntaxError(f"Unknown stage: {stage!r}", self._peek().pos)
         while self._accept(TKind.PIPE) is not None:
             stage = self._parse_stage()
-            if isinstance(stage, SortStage):
+            if isinstance(stage, list):
+                sort.extend(stage)
+            elif isinstance(stage, SortStage):
                 sort.append(stage)
             elif isinstance(stage, LimitStage):
                 limit = stage.count
@@ -137,8 +141,21 @@ class Parser:
             return self._parse_stats()
         raise TFQLSyntaxError(f"Expected pipeline stage, got {self._peek().text!r}", self._peek().pos)
 
-    def _parse_sort(self) -> SortStage:
+    def _parse_sort(self) -> list[SortStage]:
+        """Parse a SORT stage. Returns one SortStage per field.
+
+        Supports the full grammar: ``SORT ident ( ASC | DESC )? ( COMMA ident
+        ( ASC | DESC )? )*``. Each field becomes an independent sort key.
+        """
         self._advance()  # SORT
+        stages: list[SortStage] = []
+        first = self._parse_sort_field()
+        stages.append(first)
+        while self._accept(TKind.COMMA) is not None:
+            stages.append(self._parse_sort_field())
+        return stages
+
+    def _parse_sort_field(self) -> SortStage:
         field_tok = self._expect(TKind.IDENT)
         desc = False
         if self._is_keyword("ASC"):
@@ -146,12 +163,6 @@ class Parser:
         elif self._is_keyword("DESC"):
             self._advance()
             desc = True
-        # Consume additional comma-separated fields; return only the first for
-        # v0.1 to keep the contract simple, but accept and ignore extras.
-        while self._accept(TKind.COMMA) is not None:
-            self._expect(TKind.IDENT)
-            if self._is_keyword("ASC") or self._is_keyword("DESC"):
-                self._advance()
         return SortStage(field=field_tok.text, descending=desc)
 
     def _parse_limit(self) -> LimitStage:

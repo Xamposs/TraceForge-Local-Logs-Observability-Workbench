@@ -110,11 +110,24 @@ def _compile_expression(expr: Expression) -> tuple[str, list[Any]]:
     if isinstance(expr, Comparison):
         col = _canonical_field(expr.field.name)
         op = expr.op
+        # NULL semantics: = NULL and != NULL map to IS [NOT] NULL.
+        # Ordered comparisons against NULL are always unknown in SQL
+        # and so never match — we reject them at compile time so the
+        # user sees a clear error instead of silently-empty results.
+        if expr.value.kind == "null":
+            if op == "=":
+                return f"{_field_placeholder(col)} IS NULL", []
+            if op == "!=":
+                return f"{_field_placeholder(col)} IS NOT NULL", []
+            raise CompilationError(
+                f"Cannot use {op} with NULL: NULL is not orderable. "
+                f"Use '{col} IS NULL' or '{col} IS NOT NULL'."
+            )
+        if op not in ("=", "!=", ">", ">=", "<", "<="):
+            raise CompilationError(f"Unsupported operator: {op}")
         param = _literal_to_param(expr.value)
-        if expr.value.kind in ("string", "number", "bool", "null"):
-            sql = f"{_field_placeholder(col)} {op} ?"
-            return sql, [param]
-        raise CompilationError(f"Unsupported literal kind: {expr.value.kind}")
+        sql = f"{_field_placeholder(col)} {op} ?"
+        return sql, [param]
     if isinstance(expr, ContainsExpression):
         col = _canonical_field(expr.field.name)
         v = _literal_to_param(expr.value)
@@ -146,11 +159,38 @@ def _compile_expression(expr: Expression) -> tuple[str, list[Any]]:
     raise CompilationError(f"Unsupported expression: {expr!r}")
 
 
-def _compile_sort(stage: SortStage) -> str:
-    col = _canonical_field(stage.field)
+def _compile_sort(stage: SortStage, query: Query | None = None) -> str:
+    """Compile a single sort stage.
+
+    Tries the event-field whitelist first; if that fails and the
+    query provides a STATS stage, falls back to the aggregate alias
+    so users can write ``sort count() desc`` etc.
+    """
+    try:
+        col = _canonical_field(stage.field)
+    except CompilationError:
+        col = None
+    if col is None and query is not None and query.stats is not None:
+        for a in query.stats.aggregates:
+            alias = a.alias
+            if alias is None:
+                # Compute the same default alias that _compile_agg
+                # would produce.
+                if a.function == "count" and a.field is None:
+                    alias = "count"
+                elif a.field is None:
+                    alias = a.function
+                else:
+                    alias = f"{a.function}_{a.field}"
+            if alias == stage.field:
+                col = f'"{alias}"'
+                break
+    if col is None:
+        # Re-raise the original field error to give the user a clear
+        # "Unknown field" message.
+        _canonical_field(stage.field)
     direction = "DESC" if stage.descending else "ASC"
-    # Timestamp and string sorts are supported natively.
-    return f"{_field_placeholder(col)} {direction} NULLS LAST"
+    return f"{col} {direction} NULLS LAST"
 
 
 def _compile_agg(agg: AggregateCall) -> tuple[str, str]:
@@ -209,7 +249,7 @@ def compile_query(query: Query, *, base_limit: int = 1000, max_limit: int = MAX_
         group_by = f"GROUP BY {', '.join(group_cols)}" if group_cols else ""
         order = ""
         if query.sort:
-            order = "ORDER BY " + ", ".join(_compile_sort(s) for s in query.sort)
+            order = "ORDER BY " + ", ".join(_compile_sort(s, query) for s in query.sort)
         limit = ""
         if query.limit is not None:
             limit = f"LIMIT {int(min(max_limit, max(0, query.limit)))}"

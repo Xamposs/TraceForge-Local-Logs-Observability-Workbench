@@ -14,7 +14,7 @@ from dataclasses import dataclass
 # Common "looks like a primary line" heuristics.
 _PATTERNS: tuple[re.Pattern[str], ...] = (
     # ISO 8601 / common text timestamp at the very start.
-    re.compile(r"^\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"),
+    re.compile(r"^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"),
     # Apache / nginx-like: 127.0.0.1 - - [date] ...
     re.compile(r"^\S+\s+\S+\s+\S+\s+\["),
     # Bracketed timestamp: [2026-09-01 14:32:18]

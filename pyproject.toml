@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Local-first desktop observability workbench for inspecting, querying, correlating, and monitoring logs."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
     { name = "Xamposs" },
 ]
@@ -26,7 +26,6 @@ classifiers = [
     "Environment :: X11 Applications :: Qt",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows :: Windows 11",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",

@@ -52,8 +52,7 @@ def test_tailer_truncates(database: Database, temp_dir: Path) -> None:
         time.sleep(1.0)
     finally:
         tailer.stop()
-    rel = database.execute("SELECT message FROM events ORDER BY line_number")
-    messages = [r[0] for r in rel.fetchall()]
+    messages = [r[0] for r in database.fetchall("SELECT message FROM events ORDER BY line_number")]
     assert "first" in messages
     assert "second" in messages
 

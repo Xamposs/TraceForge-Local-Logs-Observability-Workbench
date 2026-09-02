@@ -129,37 +129,59 @@ def error_rate_spike(ctx: RuleContext) -> list[Alert]:
 
 @register("new_error_signature")
 def new_error_signature(ctx: RuleContext) -> list[Alert]:
-    """Alert on the first appearance of an error signature in this session."""
+    """Alert on the first appearance of a normalized error signature.
+
+    Historical comparison is performed on the *normalized* signature,
+    not the raw message. Two messages that differ only in dynamic
+    values ("Connection timeout after 5012ms" vs "...4928ms") share
+    the same signature and are treated as a single historical entry.
+    """
     cfg = ctx.config
     window_min = int(cfg.parameters.get("window_min", 60))
 
     now = ctx.now
     start = now - timedelta(minutes=window_min)
+
+    # Build the set of normalized signatures already known BEFORE the
+    # window starts. We read the raw messages and normalize in Python
+    # so the comparison matches the signature definition exactly.
+    rel = ctx.db.execute(
+        "SELECT message FROM events"
+        " WHERE severity IN ('ERROR','FATAL','CRITICAL')"
+        " AND timestamp IS NOT NULL AND timestamp < ?",
+        [start],
+    )
+    known_signatures: set[str] = set()
+    for row in rel.fetchall():
+        msg = row[0]
+        sig = normalize_signature(msg)
+        if sig:
+            known_signatures.add(sig)
+
+    # In the window, look at each error message in arrival order.
     rel = ctx.db.execute(
         "SELECT message, MIN(timestamp) FROM events"
-        " WHERE severity IN ('ERROR','FATAL','CRITICAL') AND timestamp >= ?"
+        " WHERE severity IN ('ERROR','FATAL','CRITICAL')"
+        " AND timestamp >= ?"
         " GROUP BY message",
         [start],
     )
     alerts: list[Alert] = []
+    seen_signatures: set[str] = set()
     for row in rel.fetchall():
         message = row[0]
         first_seen = row[1]
         sig = normalize_signature(message)
-        if not sig:
+        if not sig or sig in seen_signatures:
             continue
-        # "New" means it appears in the current workspace for the first time.
-        rel2 = ctx.db.execute(
-            "SELECT COUNT(*) FROM events WHERE severity IN ('ERROR','FATAL','CRITICAL')"
-            " AND message = ? AND timestamp < ?",
-            [message, first_seen],
-        )
-        prev = int(rel2.fetchone()[0] or 0)
-        if prev > 0:
+        seen_signatures.add(sig)
+        if sig in known_signatures:
             continue
         alerts.append(
             Alert(
-                id=_new_id("new_error_signature", ctx.workspace_id, sig),
+                id=_new_id(
+                    "new_error_signature", ctx.workspace_id, sig, first_seen.isoformat() if first_seen else ""
+                ),
                 rule_id="new_error_signature",
                 rule_name="New error signature",
                 severity=cfg.severity,
@@ -281,15 +303,21 @@ def event_burst(ctx: RuleContext) -> list[Alert]:
 
 @register("missing_heartbeat")
 def missing_heartbeat(ctx: RuleContext) -> list[Alert]:
-    """Alert if no events have arrived from a service in N minutes."""
+    """Alert if no events have arrived from a service in N minutes.
+
+    The check is performed over the service's overall ``MAX(timestamp)``,
+    regardless of when that timestamp sits. A service with one recent
+    event and one old event is considered alive (the recent one is the
+    heartbeat).
+    """
     cfg = ctx.config
     silence_min = int(cfg.parameters.get("silence_min", 10))
     service_filter = cfg.parameters.get("service")
 
     now = ctx.now
     cutoff = now - timedelta(minutes=silence_min)
-    where = ["timestamp < ?", "timestamp IS NOT NULL"]
-    params: list[Any] = [cutoff]
+    where = ["timestamp IS NOT NULL"]
+    params: list[Any] = []
     if service_filter:
         where.append("service = ?")
         params.append(service_filter)

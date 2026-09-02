@@ -104,12 +104,16 @@ class Session:
                 fn(event, payload)
 
     def new_workspace(self, name: str | None = None) -> Workspace:
+        """Create a fresh workspace backed by an empty database."""
         self.close()
-        ws_dir = self.app_paths.new_workspace_dir()
-        db_path = ws_dir / "events.duckdb"
-        self._db = Database(db_path)
         ws = new_workspace(name or "Untitled Workspace")
-        ws_path = ws_dir / "workspace.trf"
+        ws_dir = self.app_paths.new_workspace_dir(ws.workspace_id)
+        db_path = self.app_paths.workspace_db_path(ws.workspace_id)
+        self._db = Database(db_path)
+        # The .trf file is metadata only. The database lives in the
+        # application data tree, not beside the .trf.
+        default_trf_dir = ws_dir
+        ws_path = default_trf_dir / "workspace.trf"
         save_workspace(ws, ws_path)
         self._workspace = ws
         self._workspace_path = ws_path
@@ -117,14 +121,16 @@ class Session:
         return ws
 
     def open_workspace(self, path: str | os.PathLike[str]) -> Workspace:
+        """Open a workspace ``.trf`` file and resolve its database.
+
+        The database is looked up by the workspace's ``workspace_id``
+        under the application data directory. The .trf file's location
+        does not influence database location.
+        """
         self.close()
         ws = load_workspace(path)
-        ws_dir = Path(path).parent
-        db_path = ws_dir / "events.duckdb"
-        if not db_path.exists():
-            self._db = Database(db_path)
-        else:
-            self._db = Database(db_path)
+        db_path = self.app_paths.workspace_db_path(ws.workspace_id)
+        self._db = Database(db_path)
         self._workspace = ws
         self._workspace_path = Path(path)
         self._emit("workspace-opened", self.summary())
@@ -140,6 +146,12 @@ class Session:
             self._workspace_path = None
 
     def save_workspace_as(self, path: str | os.PathLike[str]) -> None:
+        """Save the .trf file to ``path``.
+
+        The database is NOT copied. It continues to live at the
+        workspace's existing application-data location. The .trf
+        contains only the ``workspace_id`` that keys that database.
+        """
         if self._workspace is None:
             raise RuntimeError("No workspace is open")
         self._workspace.name = Path(path).stem
@@ -229,6 +241,12 @@ class Session:
                 first_event_at=None,
                 last_event_at=None,
             )
+        # v2 schema has 18 columns:
+        # id, path, alias, enabled, parser, size_bytes, mtime_ns,
+        # sample_hash, content_kind, last_ingested_at, first_event_at,
+        # last_event_at, last_byte_offset, total_events, parsed_events,
+        # inserted_events, parse_errors, unstructured_lines, rejected_lines
+        # (19 columns total). We consume them positionally.
         (
             sid,
             path_,
@@ -240,8 +258,12 @@ class Session:
             sample_hash,
             kind,
             last_ing,
+            first_event_at,
+            last_event_at,
             last_off,
             total,
+            parsed_events,
+            inserted_events,
             parse_errors,
             unstructured,
             rejected,
@@ -253,11 +275,11 @@ class Session:
             total_events=int(total or 0),
             bytes_read=int(last_off or 0),
             bytes_total=int(size or 0),
-            parsed_lines=int(parse_errors or 0),
+            parsed_lines=int(parsed_events or 0),
             unstructured_lines=int(unstructured or 0),
             rejected_lines=int(rejected or 0),
-            first_event_at=None,
-            last_event_at=last_ing,
+            first_event_at=first_event_at,
+            last_event_at=last_event_at,
         )
 
     def source_statuses(self) -> list[SourceIngestionStatus]:

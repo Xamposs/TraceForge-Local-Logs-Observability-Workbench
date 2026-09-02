@@ -38,7 +38,7 @@ def test_save_and_load(tmp_path: Path) -> None:
     # Verify the file is valid JSON.
     parsed = json.loads(p.read_text(encoding="utf-8"))
     assert parsed["name"] == "rt"
-    assert parsed["version"] == 1
+    assert parsed["version"] == 2
     ws2 = load_workspace(p)
     assert ws2.sources[0].path == "/var/log/app.log"
     assert ws2.saved_queries[0].query == "level = ERROR"

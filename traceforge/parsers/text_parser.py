@@ -2,24 +2,29 @@
 
 Three families are supported:
 
-* ``GenericTextParser`` — a deterministic regex pattern set covering the
-  most common textual log formats. If no pattern matches, the line is
-  ingested as ``severity=UNKNOWN`` with the raw line as message.
+* ``CommonTextParser`` — a deterministic regex pattern set covering the
+  most common textual log formats. The parser keeps a
+  :class:`MultilineAssembler` across the entire line stream so
+  multi-line stack traces are correctly folded onto their primary
+  line.
 * ``ApacheAccessParser`` / ``NginxAccessParser`` — combined-log format
   (these are very similar; we share a single regex).
 * ``GenericRegexParser`` — a user-supplied regex with a field-name map.
+
+When no pattern matches, a line is ingested as ``severity=UNKNOWN``
+with the raw line as message; the pipeline never silently drops lines.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from typing import Any
 
 from traceforge.ingestion.ids import stamp_event_id
 from traceforge.models.events import LogEvent, normalize_severity
-from traceforge.parsers.base import ParsedRecord, Parser, ParserContext
+from traceforge.parsers.base import ParsedRecord, Parser, ParserContext, SourceLine
 from traceforge.parsers.multiline import MultilineAssembler
 
 _TRY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -31,7 +36,8 @@ _TRY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"(?P<level>TRACE|DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|FATAL|CRITICAL)"
             r"\s*"
             r"(?:\[(?P<service>[^\]]+)\]\s*)?"
-            r"(?P<message>.*)$"
+            r"(?P<message>.*)$",
+            re.DOTALL,
         ),
     ),
     (
@@ -39,14 +45,16 @@ _TRY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"^\s*\[(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\]"
             r"\s*\[(?P<level>[A-Z]+)\]\s*"
-            r"(?P<message>.*)$"
+            r"(?P<message>.*)$",
+            re.DOTALL,
         ),
     ),
     (
         "syslog",
         re.compile(
             r"^(?P<timestamp>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
-            r"(?P<host>\S+)\s+(?P<service>[^:]+):\s*(?P<message>.*)$"
+            r"(?P<host>\S+)\s+(?P<service>[^:]+):\s*(?P<message>.*)$",
+            re.DOTALL,
         ),
     ),
     (
@@ -56,7 +64,8 @@ _TRY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r'"(?P<method>[A-Z]+)\s+(?P<path>\S+)\s+HTTP/[\d.]+"\s+'
             r"(?P<status>\d{3})\s+(?P<size>\S+)\s*"
             r'(?:"(?P<referer>[^"]*)"\s*)?'
-            r'(?:"(?P<user_agent>[^"]*)"\s*)?'
+            r'(?:"(?P<user_agent>[^"]*)"\s*)?',
+            re.DOTALL,
         ),
     ),
     (
@@ -65,7 +74,8 @@ _TRY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s+"
             r"(?P<level>[A-Z]+)\s+"
             r"(?P<logger>\S+)\s+-\s+"
-            r"(?P<message>.*)$"
+            r"(?P<message>.*)$",
+            re.DOTALL,
         ),
     ),
 )
@@ -91,14 +101,37 @@ def _parse_text_timestamp(value: str) -> datetime | None:
             return datetime.strptime(s, fmt)
         except ValueError:
             continue
-    # Last resort: fromisoformat
     try:
         return datetime.fromisoformat(s)
     except ValueError:
         return None
 
 
+def _truncate_text(value: str, limit: int = 8000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
+
+
+def _safe_int(v: Any) -> int | None:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class CommonTextParser(Parser):
+    """Text parser with cross-line multi-line stack-trace assembly.
+
+    The parser keeps a single :class:`MultilineAssembler` for the
+    duration of one ``parse()`` call. The pipeline must therefore feed
+    the entire logical source as a single iterable to ``parse()`` —
+    calling ``parse()`` once per line is unsupported and will produce
+    incorrect output.
+    """
+
     name = "text"
 
     def detect(self, sample_lines: list[str]) -> float:
@@ -112,22 +145,55 @@ class CommonTextParser(Parser):
 
     def parse(
         self,
-        lines,
+        lines: Iterable[SourceLine],
         context: ParserContext,
     ) -> Iterator[ParsedRecord | None]:
-        asm = MultilineAssembler()
-        start = max(1, context.start_line)
-        line_index = start
-        for raw in lines:
-            for event_text in asm.feed(raw.rstrip("\n\r")):
-                yield self._build(event_text, context, line_index)
-                line_index += 1
-        for event_text in asm.flush():
-            yield self._build(event_text, context, line_index)
-            line_index += 1
-
-    def _build(self, text: str, context: ParserContext, line_no: int) -> ParsedRecord:
         now = datetime.now(tz=UTC)
+        asm = MultilineAssembler()
+        # The SourceLine that opened the currently-buffered event.
+        # This is the *primary* line — the line the event should be
+        # attributed to.
+        primary_src: SourceLine | None = None
+        for src in lines:
+            was_empty_before = not asm._buffer
+            events = list(asm.feed(src.text))
+            for event_text in events:
+                # The event was flushed because ``src`` is a new
+                # primary. The event itself was opened by the previous
+                # primary, so its source position is the previous
+                # primary_src (or ``src`` for the very first event).
+                src_for_event = primary_src if primary_src is not None else src
+                ev, unstructured = self._build(event_text, now, src_for_event)
+                yield ParsedRecord(event=ev, unstructured=unstructured)
+            # After the feed, decide what ``primary_src`` should be.
+            # If we just emitted an event above (events was non-empty),
+            # the new buffer (if any) was opened by ``src``, which is a
+            # new primary. Otherwise the buffer state is unchanged.
+            if events or was_empty_before and asm._buffer:
+                primary_src = src
+        for event_text in asm.flush():
+            ev, unstructured = self._build(
+                event_text,
+                now,
+                primary_src if primary_src is not None else _synthetic_line(context.start_line),
+            )
+            yield ParsedRecord(event=ev, unstructured=unstructured)
+            if was_empty_before and asm._buffer:
+                primary_src = src
+        for event_text in asm.flush():
+            ev, unstructured = self._build(
+                event_text,
+                now,
+                primary_src if primary_src is not None else _synthetic_line(context.start_line),
+            )
+            yield ParsedRecord(event=ev, unstructured=unstructured)
+
+    def _build(
+        self,
+        text: str,
+        now: datetime,
+        src: SourceLine,
+    ) -> tuple[LogEvent, bool]:
         for _name, pat in _TRY_PATTERNS:
             m = pat.match(text)
             if not m:
@@ -139,9 +205,9 @@ class CommonTextParser(Parser):
             service = g.get("service")
             ev = LogEvent(
                 event_id="",
-                source=context.source_alias,
-                source_path=context.source_path,
-                line_number=line_no,
+                source="",
+                source_path="",
+                line_number=src.line_number,
                 timestamp=ts,
                 ingested_at=now,
                 severity=level,
@@ -153,21 +219,19 @@ class CommonTextParser(Parser):
                 logger=g.get("logger"),
                 status_code=_safe_int(g.get("status")),
             )
-            # Use position of the matched start in source as a stable line reference.
-            # When we cannot determine it, line_number stays 0 and byte_offset encodes
-            # the raw text hash for dedup.
-            stamp_event_id(ev, text.encode("utf-8", errors="replace"), context.fingerprint_sample)
-            return ParsedRecord(event=ev, unstructured=False)
-        # Fallback: UNKNOWN text.
+            ev.byte_offset = src.byte_offset
+            ev.line_number = src.line_number
+            stamp_event_id(ev, text.encode("utf-8", errors="replace"), "")
+            return ev, False
         truncated = text.endswith("...[truncated]")
         msg = text[:8000]
         if truncated and "[truncated]" not in msg:
             msg = msg.rstrip() + "...[truncated]"
         ev = LogEvent(
             event_id="",
-            source=context.source_alias,
-            source_path=context.source_path,
-            line_number=line_no,
+            source="",
+            source_path="",
+            line_number=src.line_number,
             timestamp=None,
             ingested_at=now,
             severity="UNKNOWN",
@@ -175,79 +239,81 @@ class CommonTextParser(Parser):
             raw_text=text,
             raw_format="text",
         )
-        stamp_event_id(ev, text.encode("utf-8", errors="replace"), context.fingerprint_sample)
-        return ParsedRecord(event=ev, unstructured=True)
+        ev.byte_offset = src.byte_offset
+        ev.line_number = src.line_number
+        stamp_event_id(ev, text.encode("utf-8", errors="replace"), "")
+        return ev, True
+
+    def is_multiline_capable(self) -> bool:
+        return True
 
 
-def _safe_int(v: Any) -> int | None:
-    if v is None:
-        return None
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
+def _synthetic_line(line_no: int) -> SourceLine:
+    return SourceLine(byte_offset=0, line_number=line_no, text="", raw_bytes=b"")
 
 
 class ApacheAccessParser(CommonTextParser):
     name = "apache"
 
+    def is_multiline_capable(self) -> bool:
+        return False
+
 
 class NginxAccessParser(CommonTextParser):
     name = "nginx"
 
+    def is_multiline_capable(self) -> bool:
+        return False
+
 
 class GenericRegexParser(Parser):
-    """User-supplied regex parser.
-
-    ``context.custom_regex`` must be a regex with named groups. The
-    ``context.custom_field_map`` maps known LogEvent field names to the
-    named group, e.g. ``{"timestamp": "ts", "level": "lvl", ...}``.
-    """
+    """User-supplied regex parser."""
 
     name = "custom_regex"
-    _pattern: re.Pattern[str] | None = None
 
     def detect(self, sample_lines: list[str]) -> float:
-        # Detection is only meaningful if a regex is supplied up front.
         return 0.0
 
-    def parse(self, lines, context: ParserContext) -> Iterator[ParsedRecord | None]:
+    def parse(
+        self,
+        lines: Iterable[SourceLine],
+        context: ParserContext,
+    ) -> Iterator[ParsedRecord | None]:
         if not context.custom_regex:
             return
         try:
             pat = re.compile(context.custom_regex)
         except re.error:
-            # Bad regex: surface the entire line as UNKNOWN instead of
-            # silently dropping content.
             now = datetime.now(tz=UTC)
-            for line_no, raw in enumerate(lines, start=1):
-                text = raw.rstrip("\n\r")
+            for src in lines:
                 ev = LogEvent(
                     event_id="",
                     source=context.source_alias,
                     source_path=context.source_path,
-                    line_number=line_no,
+                    line_number=src.line_number,
                     timestamp=None,
                     ingested_at=now,
                     severity="UNKNOWN",
-                    message=text[:8000],
-                    raw_text=text,
+                    message=src.text[:8000],
+                    raw_text=src.text,
                     raw_format="regex",
                 )
-                stamp_event_id(ev, text.encode("utf-8", errors="replace"), context.fingerprint_sample)
+                ev.byte_offset = src.byte_offset
+                ev.line_number = src.line_number
+                stamp_event_id(ev, src.raw_bytes, context.fingerprint_sample)
                 yield ParsedRecord(event=ev, unstructured=True)
             return
         field_map = context.custom_field_map or {}
         now = datetime.now(tz=UTC)
-        for line_no, raw in enumerate(lines, start=1):
-            text = raw.rstrip("\n\r")
+        for src in lines:
+            text = src.text
             m = pat.search(text)
             if not m:
                 ev = LogEvent(
                     event_id="",
                     source=context.source_alias,
                     source_path=context.source_path,
-                    line_number=line_no,
+                    line_number=src.line_number,
                     timestamp=None,
                     ingested_at=now,
                     severity="UNKNOWN",
@@ -255,7 +321,9 @@ class GenericRegexParser(Parser):
                     raw_text=text,
                     raw_format="regex",
                 )
-                stamp_event_id(ev, text.encode("utf-8", errors="replace"), context.fingerprint_sample)
+                ev.byte_offset = src.byte_offset
+                ev.line_number = src.line_number
+                stamp_event_id(ev, src.raw_bytes, context.fingerprint_sample)
                 yield ParsedRecord(event=ev, unstructured=True)
                 continue
             groups = m.groupdict()
@@ -287,7 +355,7 @@ class GenericRegexParser(Parser):
                 event_id="",
                 source=context.source_alias,
                 source_path=context.source_path,
-                line_number=line_no,
+                line_number=src.line_number,
                 timestamp=ts,
                 ingested_at=now,
                 severity=lvl,
@@ -300,7 +368,9 @@ class GenericRegexParser(Parser):
                 duration_ms=float(dur) if dur is not None else None,
                 status_code=status,
             )
-            stamp_event_id(ev, text.encode("utf-8", errors="replace"), context.fingerprint_sample)
+            ev.byte_offset = src.byte_offset
+            ev.line_number = src.line_number
+            stamp_event_id(ev, src.raw_bytes, context.fingerprint_sample)
             yield ParsedRecord(event=ev, unstructured=False)
 
     def is_multiline_capable(self) -> bool:

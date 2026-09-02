@@ -7,11 +7,12 @@ explicitly whitelisted through :data:`EVENT_FIELDS` and :data:`SOURCE_FIELDS`.
 
 from __future__ import annotations
 
-import contextlib
 import json
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
+
+import duckdb
 
 from traceforge.models.events import LogEvent, SourceFingerprint, SourceStats
 from traceforge.models.sources import SourceConfig
@@ -114,21 +115,6 @@ _EVENT_INSERT_COLUMNS = (
     " duration_ms, status_code, exception_type, attributes_json"
 )
 
-_SOURCE_UPSERT = (
-    "INSERT INTO sources ("
-    "id, path, alias, enabled, parser, size_bytes, mtime_ns, sample_hash,"
-    " content_kind, last_ingested_at, last_byte_offset, total_events,"
-    " parse_errors, unstructured_lines, rejected_lines"
-    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-    "ON CONFLICT(path) DO UPDATE SET "
-    "alias=excluded.alias, enabled=excluded.enabled, parser=excluded.parser,"
-    "size_bytes=excluded.size_bytes, mtime_ns=excluded.mtime_ns,"
-    "sample_hash=excluded.sample_hash, content_kind=excluded.content_kind,"
-    "last_ingested_at=excluded.last_ingested_at, last_byte_offset=excluded.last_byte_offset,"
-    "total_events=excluded.total_events, parse_errors=excluded.parse_errors,"
-    "unstructured_lines=excluded.unstructured_lines, rejected_lines=excluded.rejected_lines"
-)
-
 
 def _event_row(event: LogEvent, source_id: int) -> tuple:
     return (
@@ -161,32 +147,6 @@ def _event_row(event: LogEvent, source_id: int) -> tuple:
     )
 
 
-def _source_row(
-    source_id: int,
-    cfg: SourceConfig,
-    fp: SourceFingerprint,
-    parser: str,
-    stats: SourceStats,
-) -> tuple:
-    return (
-        source_id,
-        cfg.path,
-        cfg.alias or cfg.path,
-        cfg.enabled,
-        parser,
-        fp.size,
-        fp.mtime_ns,
-        fp.sample_hash,
-        fp.content_kind,
-        stats.last_event_at,
-        0,
-        stats.parsed_lines,
-        len(stats.parse_errors),
-        stats.unstructured_lines,
-        stats.rejected_lines,
-    )
-
-
 class EventRepository:
     """Typed access to the events table."""
 
@@ -201,6 +161,37 @@ class EventRepository:
         current = int((row[0] if row else 0) or 0)
         return current + 1
 
+    def get_or_create_source_id(self, cfg: SourceConfig) -> int:
+        """Return the source_id for the given config's path, creating a
+        new source row if necessary.
+
+        Re-ingesting an existing path always returns the same source_id,
+        so events from successive runs can never end up under a different
+        source row.
+        """
+        path = cfg.path
+        rel = self._db.execute("SELECT id FROM sources WHERE path = ?", [path])
+        row = rel.fetchone()
+        if row is not None:
+            return int(row[0])
+        new_id = self.next_source_id()
+        # Insert a placeholder source row so that the source_id is
+        # materialised immediately. The full stats are written later by
+        # ``upsert_source`` once ingestion completes.
+        try:
+            self._db.execute(
+                "INSERT INTO sources (id, path, alias, enabled, parser) " "VALUES (?, ?, ?, ?, ?)",
+                [new_id, path, cfg.alias or path, cfg.enabled, "unknown"],
+            )
+        except duckdb.Error:
+            # Lost the race with another ingest; fall back to the
+            # existing row's id.
+            row = self._db.execute("SELECT id FROM sources WHERE path = ?", [path]).fetchone()
+            if row is not None:
+                return int(row[0])
+            raise
+        return new_id
+
     def upsert_source(
         self,
         source_id: int,
@@ -208,10 +199,57 @@ class EventRepository:
         fp: SourceFingerprint,
         parser: str,
         stats: SourceStats,
+        *,
+        run_inserted: int = 0,
+        run_parsed: int = 0,
+        last_ingested_at: datetime | None = None,
     ) -> None:
+        """Insert a new source row or update an existing one.
+
+        All counters are *additive* (a re-ingest accumulates totals).
+        """
         self._db.execute(
-            _SOURCE_UPSERT,
-            list(_source_row(source_id, cfg, fp, parser, stats)),
+            "INSERT INTO sources ("
+            "id, path, alias, enabled, parser, size_bytes, mtime_ns, sample_hash,"
+            " content_kind, last_ingested_at, first_event_at, last_event_at,"
+            " last_byte_offset, total_events, parsed_events, inserted_events,"
+            " parse_errors, unstructured_lines, rejected_lines"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT (id) DO UPDATE SET "
+            "alias = excluded.alias, enabled = excluded.enabled, parser = excluded.parser,"
+            "size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns,"
+            "sample_hash = excluded.sample_hash, content_kind = excluded.content_kind,"
+            "last_ingested_at = COALESCE(excluded.last_ingested_at, sources.last_ingested_at),"
+            "first_event_at = COALESCE(excluded.first_event_at, sources.first_event_at),"
+            "last_event_at = COALESCE(excluded.last_event_at, sources.last_event_at),"
+            "last_byte_offset = excluded.last_byte_offset,"
+            "total_events = sources.total_events + excluded.parsed_events,"
+            "parsed_events = sources.parsed_events + excluded.parsed_events,"
+            "inserted_events = sources.inserted_events + excluded.inserted_events,"
+            "parse_errors = sources.parse_errors + excluded.parse_errors,"
+            "unstructured_lines = sources.unstructured_lines + excluded.unstructured_lines,"
+            "rejected_lines = sources.rejected_lines + excluded.rejected_lines",
+            [
+                source_id,
+                cfg.path,
+                cfg.alias or cfg.path,
+                cfg.enabled,
+                parser,
+                fp.size,
+                fp.mtime_ns,
+                fp.sample_hash,
+                fp.content_kind,
+                last_ingested_at,
+                stats.first_event_at,
+                stats.last_event_at,
+                stats.bytes_read,
+                run_parsed,
+                run_parsed,
+                run_inserted,
+                len(stats.parse_errors),
+                stats.unstructured_lines,
+                stats.rejected_lines,
+            ],
         )
 
     def update_source_progress(
@@ -220,10 +258,14 @@ class EventRepository:
         *,
         last_byte_offset: int | None = None,
         total_events: int | None = None,
-        parsed_lines: int | None = None,
+        parsed_events: int | None = None,
+        inserted_events: int | None = None,
+        parse_errors: int | None = None,
         unstructured_lines: int | None = None,
         rejected_lines: int | None = None,
         last_ingested_at: datetime | None = None,
+        first_event_at: datetime | None = None,
+        last_event_at: datetime | None = None,
     ) -> None:
         sets: list[str] = []
         params: list[Any] = []
@@ -233,9 +275,15 @@ class EventRepository:
         if total_events is not None:
             sets.append("total_events = ?")
             params.append(total_events)
-        if parsed_lines is not None:
+        if parsed_events is not None:
+            sets.append("parsed_events = ?")
+            params.append(parsed_events)
+        if inserted_events is not None:
+            sets.append("inserted_events = ?")
+            params.append(inserted_events)
+        if parse_errors is not None:
             sets.append("parse_errors = ?")
-            params.append(parsed_lines)
+            params.append(parse_errors)
         if unstructured_lines is not None:
             sets.append("unstructured_lines = ?")
             params.append(unstructured_lines)
@@ -245,6 +293,12 @@ class EventRepository:
         if last_ingested_at is not None:
             sets.append("last_ingested_at = ?")
             params.append(last_ingested_at)
+        if first_event_at is not None:
+            sets.append("first_event_at = ?")
+            params.append(first_event_at)
+        if last_event_at is not None:
+            sets.append("last_event_at = ?")
+            params.append(last_event_at)
         if not sets:
             return
         params.append(source_id)
@@ -254,7 +308,8 @@ class EventRepository:
     def get_source(self, path: str) -> tuple | None:
         rel = self._db.execute(
             "SELECT id, path, alias, enabled, parser, size_bytes, mtime_ns, sample_hash,"
-            " content_kind, last_ingested_at, last_byte_offset, total_events,"
+            " content_kind, last_ingested_at, first_event_at, last_event_at,"
+            " last_byte_offset, total_events, parsed_events, inserted_events,"
             " parse_errors, unstructured_lines, rejected_lines"
             " FROM sources WHERE path = ?",
             [path],
@@ -264,7 +319,8 @@ class EventRepository:
     def list_sources(self) -> list[tuple]:
         rel = self._db.execute(
             "SELECT id, path, alias, enabled, parser, size_bytes, mtime_ns, sample_hash,"
-            " content_kind, last_ingested_at, last_byte_offset, total_events,"
+            " content_kind, last_ingested_at, first_event_at, last_event_at,"
+            " last_byte_offset, total_events, parsed_events, inserted_events,"
             " parse_errors, unstructured_lines, rejected_lines"
             " FROM sources ORDER BY alias"
         )
@@ -279,13 +335,15 @@ class EventRepository:
     # ---- events ----
 
     def insert_events(self, events: Sequence[LogEvent], source_id: int) -> int:
-        """Insert events; return the number actually inserted (dedup by PK)."""
+        """Insert events; return the number actually inserted (dedup by PK).
+
+        The returned count is the true delta: events whose ``event_id``
+        was already present in the table are silently dropped and
+        excluded from the result. This is essential for accurate
+        progress reporting when re-ingesting or live-tailing.
+        """
         if not events:
             return 0
-        # Polars-backed bulk insert is dramatically faster than the
-        # row-at-a-time parameter binding on Windows. We build a Polars
-        # DataFrame, register it as a temporary view, and ``INSERT OR IGNORE``
-        # into the events table. Dedup-by-PK is preserved.
         import polars as pl
 
         rows: list[dict] = []
@@ -321,51 +379,50 @@ class EventRepository:
                 }
             )
         df = pl.DataFrame(rows, infer_schema_length=len(rows) or 1)
-        # Optimistic count: most batches in practice are net-new inserts,
-        # so we report the full batch size. The PK constraint still
-        # enforces dedup at the database.
-        batch_size = len(events)
-        self._db.register_polars("df_bulk", df)
-        try:
-            self._db.execute("INSERT OR IGNORE INTO events BY NAME SELECT * FROM df_bulk")
-        finally:
-            with contextlib.suppress(Exception):
-                self._db.raw.unregister("df_bulk")
-        return batch_size
+        incoming_ids = [r["event_id"] for r in rows]
+        before = self._count_event_ids(incoming_ids)
+        # Atomic: register + INSERT + unregister under a single lock.
+        self._db.bulk_insert_polars(
+            "df_bulk",
+            df,
+            "events",
+            insert_sql="INSERT OR IGNORE INTO events BY NAME SELECT * FROM df_bulk",
+        )
+        after = self._count_event_ids(incoming_ids)
+        return max(0, after - before)
 
     def _count_event_ids(self, ids: Sequence[str]) -> int:
         if not ids:
             return 0
         placeholders = ",".join("?" for _ in ids)
-        rel = self._db.execute(
+        row = self._db.fetchone(
             f"SELECT COUNT(*) FROM events WHERE event_id IN ({placeholders})",
             list(ids),
         )
-        return int(rel.fetchone()[0])
+        return int(row[0]) if row else 0
 
     def count_events(self) -> int:
-        rel = self._db.execute("SELECT COUNT(*) FROM events")
-        return int(rel.fetchone()[0])
+        row = self._db.fetchone("SELECT COUNT(*) FROM events")
+        return int(row[0]) if row else 0
 
     def count_by_severity(self) -> dict[str, int]:
-        rel = self._db.execute("SELECT severity, COUNT(*) FROM events GROUP BY severity")
-        return {row[0]: int(row[1]) for row in rel.fetchall()}
+        rows = self._db.fetchall("SELECT severity, COUNT(*) FROM events GROUP BY severity")
+        return {row[0]: int(row[1]) for row in rows}
 
     def time_range(self) -> tuple[datetime | None, datetime | None]:
-        rel = self._db.execute(
+        row = self._db.fetchone(
             "SELECT MIN(timestamp), MAX(timestamp) FROM events WHERE timestamp IS NOT NULL"
         )
-        row = rel.fetchone()
-        return (row[0], row[1])
+        return (row[0], row[1]) if row else (None, None)
 
     def distinct_services(self) -> list[str]:
-        rel = self._db.execute(
+        rows = self._db.fetchall(
             "SELECT DISTINCT service FROM events WHERE service IS NOT NULL ORDER BY service"
         )
-        return [r[0] for r in rel.fetchall()]
+        return [r[0] for r in rows]
 
     def fetch_event(self, event_id: str) -> tuple | None:
-        rel = self._db.execute(
+        return self._db.fetchone(
             "SELECT event_id, source_id, source_alias, source_path, line_number,"
             " byte_offset, raw_format, timestamp, ingested_at, severity, message,"
             " raw_text, service, logger, host, process, thread,"
@@ -374,7 +431,6 @@ class EventRepository:
             " FROM events WHERE event_id = ?",
             [event_id],
         )
-        return rel.fetchone()
 
     def fetch_by_correlation(
         self,
@@ -397,19 +453,18 @@ class EventRepository:
         if not clauses:
             return []
         where = " OR ".join(clauses)
-        rel = self._db.execute(
+        return self._db.fetchall(
             "SELECT event_id, source_alias, source_path, line_number, timestamp,"
             " severity, message, service, trace_id, span_id, parent_span_id,"
             " request_id, session_id, duration_ms, status_code"
             f" FROM events WHERE {where} ORDER BY timestamp",
             params,
         )
-        return list(rel.fetchall())
 
     def event_ids_for_signature(self, signature: str) -> list[str]:
-        rel = self._db.execute(
+        rows = self._db.fetchall(
             "SELECT event_id FROM events WHERE severity IN ('ERROR','FATAL','CRITICAL')"
             " AND message LIKE ? LIMIT 500",
             [f"%{signature[:60]}%"],
         )
-        return [r[0] for r in rel.fetchall()]
+        return [r[0] for r in rows]

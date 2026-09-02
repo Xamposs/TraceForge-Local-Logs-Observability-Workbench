@@ -147,7 +147,21 @@ def tokenize(source: str) -> list[Token]:
             tokens.append(Token(TKind.STRING, "".join(buf), start))
             i = j + 1
             continue
-        # Symbols
+        # Symbols (two-character operators checked first).
+        if c in "<>!":
+            two = src[i : i + 2]
+            if c == "!" and i + 1 < n and src[i + 1] == "=":
+                tokens.append(Token(TKind.NE, two, start))
+                i += 2
+                continue
+            if c == ">" and i + 1 < n and src[i + 1] == "=":
+                tokens.append(Token(TKind.GE, two, start))
+                i += 2
+                continue
+            if c == "<" and i + 1 < n and src[i + 1] == "=":
+                tokens.append(Token(TKind.LE, two, start))
+                i += 2
+                continue
         if c == "(":
             tokens.append(Token(TKind.LPAREN, c, start))
             i += 1
@@ -162,18 +176,6 @@ def tokenize(source: str) -> list[Token]:
             continue
         if c == ",":
             tokens.append(Token(TKind.COMMA, c, start))
-            i += 1
-            continue
-        if c == ">=":
-            tokens.append(Token(TKind.GE, c, start))
-            i += 1
-            continue
-        if c == "<=":
-            tokens.append(Token(TKind.LE, c, start))
-            i += 1
-            continue
-        if c == "!=":
-            tokens.append(Token(TKind.NE, c, start))
             i += 1
             continue
         if c == "=":

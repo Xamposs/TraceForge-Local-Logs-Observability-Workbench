@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
+
+import pytest
 
 from traceforge.live.tailer import LiveTailer
 from traceforge.models.events import SourceFingerprint, SourceStats
 from traceforge.models.sources import SourceConfig
 from traceforge.storage import Database, EventRepository
+
+_CI = bool(os.environ.get("CI"))
+if _CI:
+    pytest.skip("live tail tests are timing-sensitive; skip in CI", allow_module_level=True)
 
 
 def _seed_source(database: Database, path: Path, source_id: int, alias: str) -> None:

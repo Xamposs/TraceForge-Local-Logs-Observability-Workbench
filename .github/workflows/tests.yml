@@ -48,13 +48,27 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         env:
           QT_QPA_PLATFORM: offscreen
-        run: xvfb-run -a python -m pytest -q || (echo "::error::pytest failed; verbose output follows" && xvfb-run -a python -m pytest --tb=long -q; exit 1)
+        run: |
+          xvfb-run -a python -m pytest -q
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::error::pytest failed (exit $rc); verbose output follows"
+            xvfb-run -a python -m pytest -v --tb=long || true
+            exit $rc
+          fi
 
       - name: Run tests (Windows)
         if: matrix.os == 'windows-latest'
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q || (echo "::error::pytest failed; verbose output follows" && python -m pytest --tb=long -q; exit 1)
+        run: |
+          python -m pytest -q
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::error::pytest failed (exit $rc); verbose output follows"
+            python -m pytest -v --tb=long || true
+            exit $rc
+          fi
 
       - name: Build wheel
         run: |
